@@ -17,6 +17,43 @@ Runs a web search before **every** AI response and injects the results into the 
 
 **Option B — from Git:** push this folder to a GitHub repo, then in SillyTavern go to Extensions → Install extension and paste the repo URL.
 
+## Canon dialogue (word-for-word)
+
+Turn on **Canon dialogue (wiki)** and set your main fandom wiki (e.g. `jujutsu-kaisen.fandom.com`). Every turn it:
+
+1. Searches that wiki for the current scene and fetches the top pages plus any `/Quotes` subpages.
+2. Pulls the canon lines the wiki records: `{{Quote}}` templates, Quotes sections, and quoted speech in summaries.
+3. Injects them with a rule: if the scene matches a canon moment, characters must say those lines word-for-word.
+
+Put the current chapter/episode in **Always include these pages** (or `/canonpin Chapter 12`) so that chapter's lines are always present.
+
+Wikis only record memorable lines, not full scripts, and use one translation. For complete coverage, use the lorebook builder below and add lines you care about yourself.
+
+Set the engine to **None** to use only the wiki (no web search, no API key).
+
+## Crossover roster
+
+For characters or groups from other series (e.g. Akemura Soga or the Shinuchi from Kagurabachi):
+
+1. Enter the name, the wiki (`kagurabachi.fandom.com`), optional aliases (`Soga`), and click **Add from wiki**.
+2. The extension pulls their infobox facts, intro, Appearance, Personality and Abilities/Powers (including `/Abilities` subpages) into a profile.
+3. Whenever the name or an alias shows up in recent messages, the profile is injected with an instruction to follow it exactly. Tick **always** for a character you're playing.
+
+Click the pen icon to read or fix a profile — whatever is there is exactly what the model sees.
+
+## Canon dialogue lorebook builder
+
+`tools/canon_dialogue_lorebook.py` builds one lorebook entry per chapter/episode with that chapter's recorded canon lines, ready for chapter pinning.
+
+```
+pip install requests mwparserfromhell
+python tools/canon_dialogue_lorebook.py kagurabachi.fandom.com --category Chapters --title-regex "^Chapter \d+$"
+```
+
+- `key[0]` = entry title (`Chapter 12 (Dialogue)`), `key[1]` = page title, `uid` = `displayIndex`, natural order.
+- Disabled by default so your pinning tool enables only the current chapter (`--enabled` to ship them on).
+- `excludeRecursion` + `preventRecursion` on; group `Canon Dialogue`; order 1, @depth 2 (change with `--order/--position/--depth`).
+
 ## TauriTavern
 
 Install it the same way: Extensions → Install extension → paste the repo URL.

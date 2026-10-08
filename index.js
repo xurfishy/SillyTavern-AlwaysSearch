@@ -12,9 +12,12 @@ import { POPUP_TYPE, callGenericPopup } from '../../../popup.js';
 import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.js';
 import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
 import { ARGUMENT_TYPE, SlashCommandArgument } from '../../../slash-commands/SlashCommandArgument.js';
+import { buildProfile, lookupCanonDialogue, matchRoster, searchWiki, wikiLabel } from './canon.js';
 
 const MODULE = 'alwayssearch';
 const PROMPT_KEY = '___AlwaysSearch___';
+const CANON_KEY = '___AlwaysSearch_Canon___';
+const ROSTER_KEY = '___AlwaysSearch_Roster___';
 const LOG = (...a) => console.log('[AlwaysSearch]', ...a);
 
 const ENGINES = {
@@ -24,6 +27,7 @@ const ENGINES = {
     searxng: { label: 'SearXNG (self-hosted, no key)', secret: null },
     zai: { label: 'Z.AI', secret: SECRET_KEYS.ZAI },
     koboldcpp: { label: 'KoboldCpp built-in search', secret: null },
+    none: { label: 'None — canon wiki / roster only', secret: null },
 };
 
 const DEFAULT_QUERY_PROMPT = `Below is the most recent part of a roleplay/chat.
@@ -33,6 +37,13 @@ const DEFAULT_QUERY_PROMPT = `Below is the most recent part of a roleplay/chat.
 Write ONE concise web search query (max 12 words) that would find real-world or canon facts useful for writing {{char}}'s next reply. Focus on names, places, techniques, events, or facts mentioned. Output ONLY the query text, nothing else.`;
 
 const DEFAULT_TEMPLATE = `[Web search results for "{{query}}" (retrieved {{date}}). Use any relevant facts naturally; ignore anything irrelevant. Stay in character and do not mention searching.]
+{{text}}`;
+
+const DEFAULT_CANON_TEMPLATE = `[CANON DIALOGUE REFERENCE — {{wiki}} wiki. These are the characters' actual canon lines.
+RULES: If the current scene corresponds to a canon moment below, characters MUST speak their canon lines word-for-word, exactly as written (same wording, same speaker, same moment). You may add narration, actions and thoughts around them. Only write new dialogue for moments these lines don't cover or after the story has diverged from canon, and keep it in each character's canon voice. Never move a line to a different speaker or scene.]
+{{text}}`;
+
+const DEFAULT_ROSTER_TEMPLATE = `[CANON PROFILES — characters/groups present in this scene. Follow these exactly for appearance, personality, powers and abilities. Do not invent powers, change their looks, or soften/alter their personalities.]
 {{text}}`;
 
 const defaultSettings = {
@@ -57,6 +68,21 @@ const defaultSettings = {
     show_toast: true,
     show_badge: true,
     direct_keys: {},               // only used on hosts without server search routes (TauriTavern)
+
+    // Canon wiki (verbatim dialogue)
+    canon_enabled: false,
+    canon_wiki: '',                // e.g. jujutsu-kaisen.fandom.com
+    canon_pin: '',                 // page(s) always used, e.g. "Chapter 12" (comma-separated)
+    canon_pages: 2,                // search hits per turn
+    canon_budget: 3500,
+    canon_template: DEFAULT_CANON_TEMPLATE,
+
+    // Crossover roster (appearance/personality/abilities)
+    roster_enabled: true,
+    roster: [],                    // { name, aliases[], wiki, page, always, enabled, profile, url, fetched }
+    roster_scan: 4,                // messages scanned for names
+    profile_budget: 2500,
+    roster_template: DEFAULT_ROSTER_TEMPLATE,
 };
 
 // In-memory cache: trigger key -> { query, text, sources }
@@ -69,8 +95,12 @@ function ctx() {
 }
 
 function settings() {
+    // Mutate in place: UI handlers keep references to this object
     const es = ctx().extensionSettings;
-    es[MODULE] = Object.assign({}, defaultSettings, es[MODULE] || {});
+    if (!es[MODULE] || typeof es[MODULE] !== 'object') es[MODULE] = {};
+    for (const [k, v] of Object.entries(defaultSettings)) {
+        if (!(k in es[MODULE])) es[MODULE][k] = structuredClone(v);
+    }
     return es[MODULE];
 }
 
@@ -338,73 +368,126 @@ async function buildQuery(chat) {
         query = userText.replace(/\s+/g, ' ').trim().slice(0, 200);
     }
 
+    const base = query.trim();
     if (query && s.query_suffix?.trim()) {
         query += ' ' + c.substituteParams(s.query_suffix.trim());
     }
 
-    return query.trim();
+    return { base, query: query.trim() };
 }
 
 /* ------------------------------------------------------------------ */
 /* Generation interceptor — runs before every generation               */
 /* ------------------------------------------------------------------ */
 
+function recentText(chat, n) {
+    return chat.filter(m => m && !m.is_system && m.mes).slice(-Math.max(1, n)).map(m => `${m.name}: ${m.mes}`).join('\n');
+}
+
+function fillTemplate(template, fallback, vars) {
+    let t = template || fallback;
+    if (!/{{text}}/i.test(t)) t += '\n{{text}}';
+    return ctx().substituteParamsExtended(t, vars);
+}
+
+/** Roster profiles for names in the recent messages. Cheap: profiles are cached in settings. */
+function rosterInjection(chat) {
+    const s = settings();
+    if (!s.roster_enabled || !s.roster?.length) return { text: '', sources: [] };
+    const hits = matchRoster(s.roster, recentText(chat, s.roster_scan)).filter(r => r.profile);
+    if (!hits.length) return { text: '', sources: [] };
+    const body = hits.map(r => `### ${r.name} (${wikiLabel(r.wiki)})\n${r.profile}`).join('\n\n');
+    return {
+        text: fillTemplate(s.roster_template, DEFAULT_ROSTER_TEMPLATE, { text: body }),
+        sources: hits.map(r => ({ title: `${r.name} profile`, url: r.url })),
+    };
+}
+
 globalThis.AlwaysSearch_Intercept = async function (chat, _contextSize, _abort, type) {
     const s = settings();
     const c = ctx();
 
     if (type === 'quiet') return;
-    // Always clear last turn's injection first
-    c.setExtensionPrompt(PROMPT_KEY, '', s.position, s.depth, false, s.role);
+    // Always clear last turn's injections first
+    for (const key of [PROMPT_KEY, CANON_KEY, ROSTER_KEY]) c.setExtensionPrompt(key, '', s.position, s.depth, false, s.role);
     pending = null;
 
     if (!s.enabled) return;
     if (type === 'impersonate' && !s.search_on_impersonate) return;
     if (!Array.isArray(chat) || chat.length === 0) return;
 
+    const t0 = Date.now();
+    const roster = rosterInjection(chat);
+    if (roster.text) c.setExtensionPrompt(ROSTER_KEY, roster.text, s.position, s.depth, false, s.role);
+
+    const doWeb = s.engine !== 'none';
+    const doCanon = s.canon_enabled && !!s.canon_wiki?.trim();
+    const pins = String(s.canon_pin || '').split(',').map(x => x.trim()).filter(Boolean);
+
     const { text: userText, index: userIndex } = lastUserText(chat);
-    const triggerKey = `${c.chatId}|${userIndex}|${getStringHash(userText)}`;
+    const triggerKey = `${c.chatId}|${userIndex}|${getStringHash(userText)}|${s.engine}|${doCanon ? s.canon_wiki + pins.join(',') : ''}`;
     const isReroll = type === 'swipe' || type === 'regenerate' || type === 'continue';
 
     let result = null;
-    const t0 = Date.now();
-
     try {
-        if (isReroll && !s.research_on_swipe && cache.has(triggerKey)) {
+        if ((doWeb || doCanon) && isReroll && !s.research_on_swipe && cache.has(triggerKey)) {
             result = cache.get(triggerKey);
             LOG('reusing cached search for reroll', result.query);
-        } else {
-            const query = await buildQuery(chat);
+        } else if (doWeb || doCanon) {
+            const { base, query } = await buildQuery(chat);
             if (!query) {
                 LOG('no query could be built');
-                return;
+            } else {
+                if (s.show_toast) toastr.info(query, doWeb ? 'Searching the web…' : 'Checking the canon wiki…', { timeOut: 2500 });
+                const [web, canon] = await Promise.allSettled([
+                    doWeb ? runSearch(query) : Promise.resolve({ text: '', sources: [] }),
+                    doCanon ? lookupCanonDialogue(s.canon_wiki, { query: base, pinned: pins, pages: s.canon_pages, budget: s.canon_budget }) : Promise.resolve({ text: '', sources: [] }),
+                ]);
+                if (web.status === 'rejected') throw web.reason;
+                if (canon.status === 'rejected') {
+                    console.error('[AlwaysSearch] canon lookup failed', canon.reason);
+                    if (s.show_toast) toastr.warning(String(canon.reason?.message || canon.reason).slice(0, 200), 'Canon wiki');
+                }
+                result = {
+                    query,
+                    text: web.value.text,
+                    sources: web.value.sources,
+                    canonText: canon.status === 'fulfilled' ? canon.value.text : '',
+                    canonSources: canon.status === 'fulfilled' ? canon.value.sources : [],
+                };
+                cache.set(triggerKey, result);
+                if (cache.size > 200) cache.delete(cache.keys().next().value);
             }
-            if (s.show_toast) toastr.info(query, 'Searching the web…', { timeOut: 2500 });
-            const { text, sources } = await runSearch(query);
-            result = { query, text, sources };
-            cache.set(triggerKey, result);
-            if (cache.size > 200) cache.delete(cache.keys().next().value);
         }
-
-        if (!result?.text) {
-            if (s.show_toast) toastr.warning('Search returned nothing usable.', 'Always Search');
-            return;
-        }
-
-        const date = new Date().toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' });
-        let template = s.template || DEFAULT_TEMPLATE;
-        if (!/{{text}}/i.test(template)) template += '\n{{text}}';
-        const injection = c.substituteParamsExtended(template, { text: result.text, query: result.query, date });
-
-        c.setExtensionPrompt(PROMPT_KEY, injection, s.position, s.depth, false, s.role);
-        pending = { query: result.query, sources: result.sources.slice(0, 5) };
-        lastResult = { ...result, injection, ms: Date.now() - t0 };
-        updateLastPanel();
-        LOG(`injected ${injection.length} chars in ${Date.now() - t0} ms`);
     } catch (e) {
         console.error('[AlwaysSearch] search failed', e);
         if (s.show_toast) toastr.error(String(e.message || e).slice(0, 200), 'Always Search failed');
     }
+
+    const date = new Date().toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' });
+    const parts = [];
+    if (result?.text) {
+        const inj = fillTemplate(s.template, DEFAULT_TEMPLATE, { text: result.text, query: result.query, date });
+        c.setExtensionPrompt(PROMPT_KEY, inj, s.position, s.depth, false, s.role);
+        parts.push(inj);
+    }
+    if (result?.canonText) {
+        const inj = fillTemplate(s.canon_template, DEFAULT_CANON_TEMPLATE, { text: result.canonText, wiki: wikiLabel(s.canon_wiki), query: result.query, date });
+        c.setExtensionPrompt(CANON_KEY, inj, s.position, s.depth, false, s.role);
+        parts.push(inj);
+    }
+    if (roster.text) parts.push(roster.text);
+
+    if (!parts.length) {
+        if ((doWeb || doCanon) && s.show_toast) toastr.warning('Search returned nothing usable.', 'Always Search');
+        return;
+    }
+
+    const sources = [...(result?.canonSources ?? []), ...roster.sources, ...(result?.sources ?? []).slice(0, 5)];
+    pending = { query: result?.query || 'canon profiles', sources: sources.slice(0, 10) };
+    lastResult = { query: result?.query || '(roster only)', text: parts.join('\n\n'), injection: parts.join('\n\n'), ms: Date.now() - t0 };
+    updateLastPanel();
+    LOG(`injected ${lastResult.injection.length} chars in ${lastResult.ms} ms`);
 };
 
 /* ------------------------------------------------------------------ */
@@ -449,6 +532,84 @@ function renderAllBadges() {
 /* Settings UI                                                         */
 /* ------------------------------------------------------------------ */
 
+async function fetchProfile(entry) {
+    const budget = settings().profile_budget;
+    try {
+        return await buildProfile(entry.wiki, entry.page || entry.name, budget);
+    } catch (e) {
+        // Page title didn't match exactly — use the wiki's best search hit
+        const [hit] = await searchWiki(entry.wiki, entry.page || entry.name, 1);
+        if (!hit) throw e;
+        return await buildProfile(entry.wiki, hit, budget);
+    }
+}
+
+async function addRosterEntry() {
+    const s = settings();
+    const name = String($('#as_r_name').val() || '').trim();
+    const wiki = String($('#as_r_wiki').val() || '').trim() || s.canon_wiki;
+    if (!name || !wiki) return toastr.warning('Enter a name and a wiki.');
+    const entry = {
+        name,
+        wiki,
+        page: String($('#as_r_page').val() || '').trim(),
+        aliases: String($('#as_r_aliases').val() || '').split(',').map(x => x.trim()).filter(Boolean),
+        always: $('#as_r_always').prop('checked'),
+        enabled: true,
+    };
+    const btn = $('#as_r_add').addClass('disabled').text('Fetching…');
+    try {
+        const prof = await fetchProfile(entry);
+        Object.assign(entry, { page: prof.title, profile: prof.text, url: prof.url, fetched: Date.now() });
+        s.roster = [...(s.roster || []).filter(r => r.name.toLowerCase() !== name.toLowerCase()), entry];
+        save();
+        $('#as_r_name, #as_r_page, #as_r_aliases').val('');
+        $('#as_r_always').prop('checked', false);
+        renderRoster();
+        toastr.success(`Added ${entry.name} (${prof.title})`, 'Roster');
+    } catch (e) {
+        toastr.error(String(e.message || e), 'Could not add');
+    } finally {
+        btn.removeClass('disabled').text('Add from wiki');
+    }
+}
+
+function renderRoster() {
+    const s = settings();
+    const list = $('#as_roster_list').empty();
+    if (!s.roster?.length) {
+        list.append('<small class="alwayssearch-last">No characters yet.</small>');
+        return;
+    }
+    s.roster.forEach((r, i) => {
+        const row = $(`
+<div class="alwayssearch-roster-row">
+  <input type="checkbox" class="as_r_enabled" title="Enabled">
+  <span class="alwayssearch-roster-name" title="${escapeHtml(r.page)}">${escapeHtml(r.name)} <small>${escapeHtml(wikiLabel(r.wiki))}${r.aliases?.length ? ' · ' + escapeHtml(r.aliases.join(', ')) : ''}</small></span>
+  <label title="Always include"><input type="checkbox" class="as_r_always_t"> always</label>
+  <div class="menu_button fa-solid fa-pen as_r_edit" title="View / edit profile"></div>
+  <div class="menu_button fa-solid fa-rotate as_r_refresh" title="Re-fetch from wiki"></div>
+  <div class="menu_button fa-solid fa-trash as_r_del" title="Remove"></div>
+</div>`);
+        row.find('.as_r_enabled').prop('checked', r.enabled !== false).on('change', function () { r.enabled = this.checked; save(); });
+        row.find('.as_r_always_t').prop('checked', !!r.always).on('change', function () { r.always = this.checked; save(); });
+        row.find('.as_r_edit').on('click', async () => {
+            const edited = await callGenericPopup(`<b>${escapeHtml(r.name)}</b> — edit freely; this exact text is injected.`, POPUP_TYPE.INPUT, r.profile || '', { rows: 20, wide: true, large: true });
+            if (typeof edited === 'string') { r.profile = edited; save(); }
+        });
+        row.find('.as_r_refresh').on('click', async () => {
+            try {
+                const prof = await fetchProfile(r);
+                Object.assign(r, { page: prof.title, profile: prof.text, url: prof.url, fetched: Date.now() });
+                save();
+                toastr.success(`Refreshed ${r.name}`);
+            } catch (e) { toastr.error(String(e.message || e)); }
+        });
+        row.find('.as_r_del').on('click', () => { s.roster.splice(i, 1); save(); renderRoster(); });
+        list.append(row);
+    });
+}
+
 function settingsHtml() {
     const engineOptions = Object.entries(ENGINES).map(([k, v]) => `<option value="${k}">${v.label}</option>`).join('');
     return `
@@ -489,6 +650,41 @@ function settingsHtml() {
       <input id="as_query_suffix" class="text_pole" type="text">
       <label class="checkbox_label"><input type="checkbox" id="as_research_on_swipe"> <span>New search on swipe/regenerate (off = reuse the last results)</span></label>
       <label class="checkbox_label"><input type="checkbox" id="as_search_on_impersonate"> <span>Also search on Impersonate</span></label>
+
+      <h4>Canon dialogue (wiki)</h4>
+      <label class="checkbox_label"><input type="checkbox" id="as_canon_enabled"> <span>Pull canon lines from a wiki every turn and require them word-for-word</span></label>
+      <div id="as_canon_rows">
+        <label for="as_canon_wiki">Main fandom wiki</label>
+        <input id="as_canon_wiki" class="text_pole" type="text" placeholder="jujutsu-kaisen.fandom.com">
+        <label for="as_canon_pin">Always include these pages <small>(current chapter/episode, comma-separated; /canonpin)</small></label>
+        <input id="as_canon_pin" class="text_pole" type="text" placeholder="Chapter 12">
+        <div class="flex-container">
+          <div class="flex1"><label for="as_canon_pages">Search hits / turn</label><input id="as_canon_pages" class="text_pole" type="number" min="0" max="5"></div>
+          <div class="flex1"><label for="as_canon_budget">Budget (chars)</label><input id="as_canon_budget" class="text_pole" type="number" min="500" max="30000" step="100"></div>
+        </div>
+        <label for="as_canon_template">Canon template <small>({{text}}, {{wiki}})</small></label>
+        <textarea id="as_canon_template" class="text_pole textarea_compact" rows="5"></textarea>
+        <div id="as_canon_test" class="menu_button">Test canon lookup</div>
+      </div>
+
+      <h4>Crossover roster</h4>
+      <small>Characters or groups from any wiki. When one is named in recent messages, its canon appearance, personality and abilities are injected.</small>
+      <label class="checkbox_label"><input type="checkbox" id="as_roster_enabled"> <span>Use roster</span></label>
+      <div id="as_roster_list" class="alwayssearch-roster"></div>
+      <div class="alwayssearch-roster-add">
+        <input id="as_r_name" class="text_pole" type="text" placeholder="Name (e.g. Akemura Soga)">
+        <input id="as_r_wiki" class="text_pole" type="text" placeholder="Wiki (e.g. kagurabachi.fandom.com)">
+        <input id="as_r_page" class="text_pole" type="text" placeholder="Wiki page title (optional, defaults to name)">
+        <input id="as_r_aliases" class="text_pole" type="text" placeholder="Aliases, comma-separated (e.g. Soga)">
+        <label class="checkbox_label"><input type="checkbox" id="as_r_always"> <span>Always include (e.g. a character you're playing)</span></label>
+        <div id="as_r_add" class="menu_button">Add from wiki</div>
+      </div>
+      <div class="flex-container">
+        <div class="flex1"><label for="as_roster_scan">Messages scanned for names</label><input id="as_roster_scan" class="text_pole" type="number" min="1" max="30"></div>
+        <div class="flex1"><label for="as_profile_budget">Chars per profile</label><input id="as_profile_budget" class="text_pole" type="number" min="500" max="20000" step="100"></div>
+      </div>
+      <label for="as_roster_template">Roster template <small>({{text}})</small></label>
+      <textarea id="as_roster_template" class="text_pole textarea_compact" rows="3"></textarea>
 
       <h4>Results</h4>
       <label for="as_budget">Snippet budget (characters)</label>
@@ -538,6 +734,7 @@ function refreshVisibility() {
     $('#as_searxng_row').toggle(s.engine === 'searxng');
     $('#as_smart_row').toggle(s.query_mode === 'smart');
     $('#as_visit_row').toggle(!!s.visit_pages);
+    $('#as_canon_rows').toggle(!!s.canon_enabled);
     if (isTauriTavern()) {
         $('#as_host_note').text(s.engine === 'searxng'
             ? 'TauriTavern detected: SearXNG runs natively. Approve the endpoint prompt the first time.'
@@ -589,6 +786,33 @@ async function initUi() {
     bind('as_template', 'template');
     bind('as_show_toast', 'show_toast', 'checkbox');
     bind('as_show_badge', 'show_badge', 'checkbox');
+    bind('as_canon_enabled', 'canon_enabled', 'checkbox');
+    bind('as_canon_wiki', 'canon_wiki');
+    bind('as_canon_pin', 'canon_pin');
+    bind('as_canon_pages', 'canon_pages', 'number');
+    bind('as_canon_budget', 'canon_budget', 'number');
+    bind('as_canon_template', 'canon_template');
+    bind('as_roster_enabled', 'roster_enabled', 'checkbox');
+    bind('as_roster_scan', 'roster_scan', 'number');
+    bind('as_profile_budget', 'profile_budget', 'number');
+    bind('as_roster_template', 'roster_template');
+
+    $('#as_canon_test').on('click', async () => {
+        const s = settings();
+        if (!s.canon_wiki) return toastr.warning('Set the main fandom wiki first.');
+        const q = await callGenericPopup('Canon lookup query (names, events):', POPUP_TYPE.INPUT, '');
+        if (q === null || q === false) return;
+        try {
+            const pins = String(s.canon_pin || '').split(',').map(x => x.trim()).filter(Boolean);
+            const { text } = await lookupCanonDialogue(s.canon_wiki, { query: String(q), pinned: pins, pages: s.canon_pages, budget: s.canon_budget });
+            await callGenericPopup(`<pre class="alwayssearch-pre">${escapeHtml(text || '(no canon lines found)')}</pre>`, POPUP_TYPE.TEXT, '', { wide: true, large: true });
+        } catch (e) {
+            toastr.error(String(e.message || e), 'Canon lookup failed');
+        }
+    });
+
+    $('#as_r_add').on('click', addRosterEntry);
+    renderRoster();
 
     $('#as_key_save').on('click', async () => {
         const key = String($('#as_key').val() || '').trim();
@@ -626,6 +850,10 @@ async function initUi() {
         const s = settings();
         s.query_prompt = DEFAULT_QUERY_PROMPT;
         s.template = DEFAULT_TEMPLATE;
+        s.canon_template = DEFAULT_CANON_TEMPLATE;
+        s.roster_template = DEFAULT_ROSTER_TEMPLATE;
+        $('#as_canon_template').val(s.canon_template);
+        $('#as_roster_template').val(s.roster_template);
         $('#as_query_prompt').val(s.query_prompt);
         $('#as_template').val(s.template);
         save();
@@ -635,6 +863,22 @@ async function initUi() {
 }
 
 function registerCommands() {
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'canonpin',
+        helpString: 'Set the canon wiki page(s) always used for dialogue, e.g. /canonpin Chapter 12. No argument clears it.',
+        unnamedArgumentList: [
+            SlashCommandArgument.fromProps({ description: 'page title(s), comma-separated', typeList: [ARGUMENT_TYPE.STRING], isRequired: false }),
+        ],
+        callback: (_args, value) => {
+            const s = settings();
+            s.canon_pin = String(value || '').trim();
+            $('#as_canon_pin').val(s.canon_pin);
+            save();
+            toastr.info(s.canon_pin ? `Canon pinned: ${s.canon_pin}` : 'Canon pin cleared');
+            return s.canon_pin;
+        },
+    }));
+
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'alwayssearch',
         helpString: 'Turn Always Search on/off. Usage: /alwayssearch on | off | toggle (no argument = show state).',

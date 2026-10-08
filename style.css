@@ -39,3 +39,42 @@
     margin: 4px 0 0 1.2em;
     padding: 0;
 }
+
+.alwayssearch-roster {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: 6px 0;
+}
+
+.alwayssearch-roster-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.alwayssearch-roster-row .menu_button {
+    padding: 4px 8px;
+    margin: 0;
+}
+
+.alwayssearch-roster-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.alwayssearch-roster-name small {
+    opacity: 0.6;
+}
+
+.alwayssearch-roster-add {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 6px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 6px;
+}
