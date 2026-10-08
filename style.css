@@ -1,0 +1,41 @@
+.alwayssearch-settings h4 {
+    margin: 10px 0 4px;
+}
+
+.alwayssearch-settings textarea {
+    font-family: monospace;
+    font-size: 0.85em;
+}
+
+.alwayssearch-last {
+    display: block;
+    margin-top: 6px;
+    opacity: 0.7;
+}
+
+.alwayssearch-pre {
+    white-space: pre-wrap;
+    text-align: left;
+    font-size: 0.85em;
+}
+
+.alwayssearch-badge {
+    margin-top: 4px;
+    font-size: 0.8em;
+    opacity: 0.6;
+}
+
+.alwayssearch-badge:hover,
+.alwayssearch-badge[open] {
+    opacity: 0.95;
+}
+
+.alwayssearch-badge summary {
+    cursor: pointer;
+    user-select: none;
+}
+
+.alwayssearch-badge ul {
+    margin: 4px 0 0 1.2em;
+    padding: 0;
+}

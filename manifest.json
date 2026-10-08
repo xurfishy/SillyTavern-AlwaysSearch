@@ -1,0 +1,13 @@
+{
+    "display_name": "Always Search",
+    "loading_order": 49,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "xurfishy",
+    "generate_interceptor": "AlwaysSearch_Intercept",
+    "version": "1.0.0",
+    "homePage": "https://github.com/xurfishy/SillyTavern-AlwaysSearch",
+    "auto_update": false
+}
